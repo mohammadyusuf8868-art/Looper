@@ -17,7 +17,7 @@ export function computeBlendAlpha(p: number, curve: LoopSettings['crossfadeCurve
 }
 
 export interface ExportProgressCallback {
-  (progress: number, statusText: string): void;
+  (progress: number, statusText: string, currentFrame?: number, totalFrames?: number): void;
 }
 
 /**
@@ -89,13 +89,13 @@ export function calculateExportBitrate(
   let baseBitrate = 4_000_000;
 
   if (pixelCount >= 3840 * 2160) {
-    baseBitrate = 22_000_000; // 4K UHD
+    baseBitrate = 20_000_000; // 4K UHD
   } else if (pixelCount >= 1920 * 1080) {
     baseBitrate = 8_000_000;  // 1080p FHD
   } else if (pixelCount >= 1280 * 720) {
-    baseBitrate = 4_500_000;  // 720p HD
+    baseBitrate = 4_000_000;  // 720p HD
   } else {
-    baseBitrate = 2_400_000;  // 540p / SD
+    baseBitrate = 2_200_000;  // 540p / SD
   }
 
   // FPS scaling
@@ -107,7 +107,7 @@ export function calculateExportBitrate(
 
   // Preset scaling
   if (preset === 'high') {
-    return Math.round(baseBitrate * 1.5);
+    return Math.round(baseBitrate * 1.4);
   } else if (preset === 'economy') {
     return Math.round(baseBitrate * 0.65);
   }
@@ -115,13 +115,37 @@ export function calculateExportBitrate(
 }
 
 /**
- * Seeks a video element to a target timestamp cleanly and waits for the seeked event.
- * Video must be attached to the DOM so the browser hardware pipeline updates the frame texture.
+ * Ensures video element has decoded frame data ready before drawing.
+ */
+function waitForVideoReady(video: HTMLVideoElement): Promise<void> {
+  if (video.readyState >= 3) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let done = false;
+    const cleanup = () => {
+      if (!done) {
+        done = true;
+        video.removeEventListener('canplay', cleanup);
+        video.removeEventListener('loadeddata', cleanup);
+        resolve();
+      }
+    };
+
+    video.addEventListener('canplay', cleanup, { once: true });
+    video.addEventListener('loadeddata', cleanup, { once: true });
+    // Fallback in case of quick load
+    setTimeout(cleanup, 1200);
+  });
+}
+
+/**
+ * Seeks a video element to a target timestamp cleanly and ensures frame texture is ready.
+ * Uses requestVideoFrameCallback or double requestAnimationFrame to ensure non-blank pixels.
  */
 function seekVideoFrame(video: HTMLVideoElement, targetTime: number): Promise<void> {
   const clampedTarget = Math.max(0, Math.min((video.duration || 9999) - 0.001, targetTime));
 
-  // If already at target within 1 millisecond and not in the middle of a seek, resolve immediately
+  // If already at target within 1ms and not currently seeking, return immediately
   if (Math.abs(video.currentTime - clampedTarget) < 0.001 && !video.seeking) {
     return Promise.resolve();
   }
@@ -135,29 +159,51 @@ function seekVideoFrame(video: HTMLVideoElement, targetTime: number): Promise<vo
         finished = true;
         if (timer) clearTimeout(timer);
         video.removeEventListener('seeked', onSeeked);
-        resolve();
+        // Double RAF gives GPU compositor time to commit the video texture to the element
+        requestAnimationFrame(() => {
+          resolve();
+        });
       }
     };
 
     const onSeeked = () => {
+      if ('requestVideoFrameCallback' in video) {
+        try {
+          (video as any).requestVideoFrameCallback(() => {
+            cleanup();
+          });
+          return;
+        } catch {
+          // Fall through
+        }
+      }
       cleanup();
     };
 
-    // 400ms safety timeout in case decoder drops seeked event
-    timer = setTimeout(cleanup, 400);
+    // 450ms safety timeout in case decoder delays seeked event
+    timer = setTimeout(cleanup, 450);
     video.addEventListener('seeked', onSeeked, { once: true });
     video.currentTime = clampedTarget;
   });
 }
 
 /**
- * Finds a verified supported codec for WebCodecs VideoEncoder.
+ * Finds a verified supported codec for WebCodecs VideoEncoder across maximum devices.
+ * Tests universal Baseline profiles first for maximum Android/iOS/low-spec compatibility.
  */
 async function findSupportedCodec(wantMp4: boolean, width: number, height: number): Promise<string | null> {
   if (typeof VideoEncoder === 'undefined') return null;
 
-  const mp4Candidates = ['avc1.4d002a', 'avc1.640028', 'avc1.42001f'];
+  // Candidates ordered from universal baseline compatibility to high profile
+  const mp4Candidates = [
+    'avc1.42001e', // Baseline Profile Level 3.0 (universal mobile support)
+    'avc1.42001f', // Baseline Profile Level 3.1
+    'avc1.4d001f', // Main Profile Level 3.1
+    'avc1.4d002a', // Main Profile Level 4.2
+    'avc1.640028', // High Profile Level 4.0
+  ];
   const webmCandidates = ['vp09.00.10.08', 'vp8'];
+
   const candidates = wantMp4 ? mp4Candidates : webmCandidates;
 
   for (const c of candidates) {
@@ -181,69 +227,98 @@ async function findSupportedCodec(wantMp4: boolean, width: number, height: numbe
 
 /**
  * Exports seamless looped video with frame-accurate presentation timestamps.
- * Uses WebCodecs (mp4-muxer / webm-muxer) for zero-stutter frame-deterministic output,
- * with fallback to MediaRecorder + fixWebmDuration.
+ * Uses WebCodecs for zero-stutter frame-deterministic output,
+ * with graceful fallback to MediaRecorder + duration fixing.
  */
 export async function exportLoopedVideo(
   videoSourceUrl: string,
   settings: LoopSettings,
   exportSettings: ExportSettings,
   onProgress: ExportProgressCallback,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  livePreviewCanvas?: HTMLCanvasElement | null
 ): Promise<Blob> {
-  // Create off-screen video elements
+  // Create video elements for frame extraction
   const v1 = document.createElement('video');
   const v2 = document.createElement('video');
-  v1.src = videoSourceUrl;
-  v2.src = videoSourceUrl;
   v1.muted = true;
   v2.muted = true;
   v1.playsInline = true;
   v2.playsInline = true;
-  v1.crossOrigin = 'anonymous';
-  v2.crossOrigin = 'anonymous';
+  v1.preload = 'auto';
+  v2.preload = 'auto';
 
-  // Attach to DOM in an invisible container so hardware acceleration and seeked events operate reliably
-  const offscreenContainer = document.createElement('div');
-  offscreenContainer.style.cssText =
-    'position:fixed;top:-9999px;left:-9999px;width:16px;height:16px;opacity:0.001;pointer-events:none;overflow:hidden;z-index:-9999;';
-  offscreenContainer.appendChild(v1);
-  offscreenContainer.appendChild(v2);
-  document.body.appendChild(offscreenContainer);
+  // Only set crossOrigin on remote HTTP(S) URLs, NEVER on blob: or data: URLs to prevent security tainting
+  const isBlobOrData = videoSourceUrl.startsWith('blob:') || videoSourceUrl.startsWith('data:');
+  if (!isBlobOrData) {
+    v1.crossOrigin = 'anonymous';
+    v2.crossOrigin = 'anonymous';
+  }
+
+  v1.src = videoSourceUrl;
+  v2.src = videoSourceUrl;
+
+  // Attach to DOM in an active but unobtrusive position so browser hardware decoders NEVER sleep or drop frames
+  const container = document.createElement('div');
+  container.style.cssText =
+    'position:fixed;bottom:2px;right:2px;width:8px;height:8px;opacity:0.02;pointer-events:none;overflow:hidden;z-index:99999;';
+  container.appendChild(v1);
+  container.appendChild(v2);
+  document.body.appendChild(container);
 
   const cleanupDom = () => {
     try {
-      if (offscreenContainer.parentNode) {
-        offscreenContainer.parentNode.removeChild(offscreenContainer);
+      v1.pause();
+      v2.pause();
+      v1.removeAttribute('src');
+      v2.removeAttribute('src');
+      v1.load();
+      v2.load();
+      if (container.parentNode) {
+        container.parentNode.removeChild(container);
       }
     } catch {}
   };
 
   try {
+    // Wait for video metadata
     await Promise.all([
       new Promise((res) => {
+        if (v1.readyState >= 1) return res(undefined);
         v1.onloadedmetadata = res;
       }),
       new Promise((res) => {
+        if (v2.readyState >= 1) return res(undefined);
         v2.onloadedmetadata = res;
       }),
     ]);
 
+    // Warm up decoders to ensure frame buffers are active
+    await Promise.all([waitForVideoReady(v1), waitForVideoReady(v2)]);
+
     const sourceWidth = v1.videoWidth || 1280;
     const sourceHeight = v1.videoHeight || 720;
 
-    // Calculate resolution
+    // Calculate resolution with strictly even dimensions
     const { width: exportWidth, height: exportHeight } = calculateExportDimensions(
       sourceWidth,
       sourceHeight,
       exportSettings.resolution || (exportSettings.quality === 'medium' ? '720p' : 'original')
     );
 
+    // Primary off-screen render canvas
     const canvas = document.createElement('canvas');
     canvas.width = exportWidth;
     canvas.height = exportHeight;
     const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
     if (!ctx) throw new Error('Could not obtain 2D canvas context');
+
+    // Live preview canvas sync helper
+    const liveCtx = livePreviewCanvas?.getContext('2d');
+    if (livePreviewCanvas) {
+      livePreviewCanvas.width = exportWidth;
+      livePreviewCanvas.height = exportHeight;
+    }
 
     const inP = Math.max(0, settings.inPoint);
     const outP = Math.max(inP + 0.5, Math.min(v1.duration || 10, settings.outPoint));
@@ -282,7 +357,9 @@ export async function exportLoopedVideo(
 
     onProgress(
       0,
-      `Initializing ${wantMp4 ? 'MP4 (H.264 Universal)' : 'WebM (VP9)'} ${exportWidth}x${exportHeight} @ ${fps} FPS (${(bitrate / 1_000_000).toFixed(1)} Mbps)...`
+      `Initializing ${wantMp4 ? 'MP4 (Universal)' : 'WebM (VP9)'} ${exportWidth}×${exportHeight} @ ${fps} FPS...`,
+      0,
+      totalFrames
     );
 
     // Check WebCodecs support
@@ -353,10 +430,12 @@ export async function exportLoopedVideo(
           const currentTime = f / fps;
           const progress = Math.round((f / totalFrames) * 96);
 
-          if (f % 6 === 0 || f === totalFrames - 1) {
+          if (f % 5 === 0 || f === totalFrames - 1) {
             onProgress(
               progress,
-              `Rendering frame ${f + 1} of ${totalFrames} (${Math.round(((f + 1) / totalFrames) * 100)}%)...`
+              `Rendering frame ${f + 1} of ${totalFrames} (${Math.round(((f + 1) / totalFrames) * 100)}%)...`,
+              f + 1,
+              totalFrames
             );
           }
 
@@ -374,6 +453,11 @@ export async function exportLoopedVideo(
             xfade,
             settings
           );
+
+          // Update live preview in UI if available
+          if (liveCtx && livePreviewCanvas) {
+            liveCtx.drawImage(canvas, 0, 0);
+          }
 
           // Feed frame with exact microsecond presentation timestamp
           const timestampUs = Math.round((f / fps) * 1_000_000);
@@ -395,26 +479,27 @@ export async function exportLoopedVideo(
           }
         }
 
-        onProgress(97, 'Finalizing video container & indexing tracks...');
+        onProgress(97, 'Finalizing video container & indexing tracks...', totalFrames, totalFrames);
         await videoEncoder.flush();
         videoEncoder.close();
 
         if (mp4Muxer) {
           mp4Muxer.finalize();
           const buffer = mp4Muxer.target.buffer;
-          onProgress(100, `Seamless MP4 export complete (${exactDuration.toFixed(1)}s @ ${fps} FPS)!`);
+          onProgress(100, `Seamless MP4 export complete (${exactDuration.toFixed(1)}s @ ${fps} FPS)!`, totalFrames, totalFrames);
           return new Blob([buffer], { type: 'video/mp4' });
         } else if (webmMuxer) {
           webmMuxer.finalize();
           const buffer = webmMuxer.target.buffer;
-          onProgress(100, `Seamless WebM export complete (${exactDuration.toFixed(1)}s @ ${fps} FPS)!`);
+          onProgress(100, `Seamless WebM export complete (${exactDuration.toFixed(1)}s @ ${fps} FPS)!`, totalFrames, totalFrames);
           return new Blob([buffer], { type: 'video/webm' });
         }
       } catch (err) {
         try {
           videoEncoder.close();
         } catch {}
-        throw err;
+        // If WebCodecs failed midway, fall through to MediaRecorder
+        console.warn('WebCodecs encoding fallback triggered:', err);
       }
     }
 
@@ -435,7 +520,8 @@ export async function exportLoopedVideo(
       settings,
       bitrate,
       onProgress,
-      signal
+      signal,
+      livePreviewCanvas
     );
   } finally {
     cleanupDom();
@@ -444,12 +530,6 @@ export async function exportLoopedVideo(
 
 /**
  * Draws the mathematically seamless blended frame to the canvas for the given time.
- * Seamless Crossfade Math:
- * - Single loop cycle duration is L - X (clipDuration - crossfadeDuration).
- * - From cycleTime 0 to (L - 2X): Stream 1 plays cleanly forward from inPoint + X to outPoint - X.
- * - From cycleTime (L - 2X) to (L - X): Stream 1 finishes to outPoint while Stream 2 dissolves in from inPoint to inPoint + X.
- * - When wrapped to cycleTime 0: Stream 1 is at inPoint + X, exactly continuing where Stream 2 dissolved in!
- * - Result: 100% zero-discontinuity, completely seamless perpetual loop in any player!
  */
 async function renderCompositeFrame(
   ctx: CanvasRenderingContext2D,
@@ -538,11 +618,13 @@ async function renderWithMediaRecorder(
   settings: LoopSettings,
   bitrate: number,
   onProgress: ExportProgressCallback,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  livePreviewCanvas?: HTMLCanvasElement | null
 ): Promise<Blob> {
   return new Promise(async (resolve, reject) => {
     try {
       const stream = canvas.captureStream(fps);
+      const liveCtx = livePreviewCanvas?.getContext('2d');
 
       const mimeCandidates = [
         'video/webm;codecs=vp9',
@@ -570,11 +652,11 @@ async function renderWithMediaRecorder(
       recorder.onstop = async () => {
         try {
           const rawBlob = new Blob(chunks, { type: selectedMime || 'video/webm' });
-          onProgress(98, 'Injecting duration metadata header...');
+          onProgress(98, 'Injecting duration metadata header...', totalFrames, totalFrames);
 
           const durationMs = Math.round(totalDuration * 1000);
           const fixedBlob = await fixWebmDuration(rawBlob, durationMs);
-          onProgress(100, `Seamless WebM export complete (${totalDuration.toFixed(1)}s @ ${fps} FPS)!`);
+          onProgress(100, `Seamless WebM export complete (${totalDuration.toFixed(1)}s @ ${fps} FPS)!`, totalFrames, totalFrames);
           resolve(fixedBlob);
         } catch {
           resolve(new Blob(chunks, { type: selectedMime || 'video/webm' }));
@@ -594,16 +676,20 @@ async function renderWithMediaRecorder(
         const progress = Math.round((f / totalFrames) * 95);
 
         if (f % 5 === 0 || f === totalFrames - 1) {
-          onProgress(progress, `Rendering frame ${f + 1} of ${totalFrames} (${progress}%)...`);
+          onProgress(progress, `Rendering frame ${f + 1} of ${totalFrames} (${progress}%)...`, f + 1, totalFrames);
         }
 
         await renderCompositeFrame(ctx, canvas, v1, v2, currentTime, loopDuration, clipDuration, inP, outP, xfade, settings);
+
+        if (liveCtx && livePreviewCanvas) {
+          liveCtx.drawImage(canvas, 0, 0);
+        }
 
         // Frame interval pacing
         await new Promise((r) => setTimeout(r, Math.round(1000 / fps)));
       }
 
-      onProgress(97, 'Finalizing video stream...');
+      onProgress(97, 'Finalizing video stream...', totalFrames, totalFrames);
       recorder.stop();
     } catch (err) {
       reject(err);

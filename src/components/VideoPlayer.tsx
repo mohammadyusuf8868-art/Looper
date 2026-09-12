@@ -33,7 +33,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   const [activeSlot, setActiveSlot] = useState<1 | 2>(1);
   const [isCrossfading, setIsCrossfading] = useState(false);
-  const [blendProgress, setBlendProgress] = useState(0);
   const [isDragOver, setIsDragOver] = useState(false);
   const [pingPongDirection, setPingPongDirection] = useState<'forward' | 'backward'>('forward');
 
@@ -46,6 +45,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   const activeSlotRef = useRef(activeSlot);
   activeSlotRef.current = activeSlot;
+
+  const isCrossfadingRef = useRef(false);
+  const dissolveTextRef = useRef<HTMLSpanElement>(null);
 
   const pingPongDirectionRef = useRef(pingPongDirection);
   pingPongDirectionRef.current = pingPongDirection;
@@ -159,8 +161,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
           const leadCurrent = leadVid.currentTime;
 
-          // Throttle state update to App to prevent 60fps React re-render thrashing
-          if (Math.abs(leadCurrent - lastReportedTimeRef.current) >= 0.04) {
+          // Throttle state update to App to prevent React re-render thrashing (~10 updates/sec is perfect for timeline)
+          if (Math.abs(leadCurrent - lastReportedTimeRef.current) >= 0.1) {
             lastReportedTimeRef.current = leadCurrent;
             lastExternalSeekRef.current = leadCurrent;
             setCurrentTime(leadCurrent);
@@ -170,10 +172,15 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
           if (leadCurrent >= fadeTrigger && leadCurrent <= curSettings.outPoint) {
             // In Crossfade zone
-            setIsCrossfading(true);
+            if (!isCrossfadingRef.current) {
+              isCrossfadingRef.current = true;
+              setIsCrossfading(true);
+            }
             const rawProgress = (leadCurrent - fadeTrigger) / Math.max(0.005, curXfade);
             const progress = Math.max(0, Math.min(1, rawProgress));
-            setBlendProgress(progress);
+            if (dissolveTextRef.current) {
+              dissolveTextRef.current.textContent = `DISSOLVING ${Math.round(progress * 100)}%`;
+            }
 
             const alphaNext = computeBlendAlpha(progress, curSettings.crossfadeCurve);
 
@@ -209,8 +216,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               const nextSlot = slot === 1 ? 2 : 1;
               activeSlotRef.current = nextSlot;
               setActiveSlot(nextSlot);
-              setIsCrossfading(false);
-              setBlendProgress(0);
+              if (isCrossfadingRef.current) {
+                isCrossfadingRef.current = false;
+                setIsCrossfading(false);
+              }
               setLoopCount((c) => c + 1);
 
               if (!curSettings.muted) {
@@ -219,8 +228,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             }
           } else {
             // Normal Single Video Playback
-            setIsCrossfading(false);
-            setBlendProgress(0);
+            if (isCrossfadingRef.current) {
+              isCrossfadingRef.current = false;
+              setIsCrossfading(false);
+            }
 
             if (!curSettings.muted) {
               leadVid.volume = curSettings.volume;
@@ -386,32 +397,32 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           : 'border-stone-800/90'
       }`}
     >
-      {/* Hidden synchronized video elements */}
+      {/* Synchronized video elements - kept alive in DOM to prevent browser decoder throttling */}
       <video
         ref={video1Ref}
         src={source.url}
         playsInline
+        preload="auto"
         muted={settings.muted}
-        crossOrigin="anonymous"
         onEnded={() => handleNativeEnded(1)}
-        className="hidden"
+        style={{ position: 'absolute', width: 2, height: 2, opacity: 0.001, pointerEvents: 'none', zIndex: -10 }}
       />
       <video
         ref={video2Ref}
         src={source.url}
         playsInline
+        preload="auto"
         muted={settings.muted}
-        crossOrigin="anonymous"
         onEnded={() => handleNativeEnded(2)}
-        className="hidden"
+        style={{ position: 'absolute', width: 2, height: 2, opacity: 0.001, pointerEvents: 'none', zIndex: -10 }}
       />
 
       {/* Main High-Performance Blended Canvas */}
       <canvas
         id="video-player-canvas"
         ref={canvasRef}
-        width={source.width || 1280}
-        height={source.height || 720}
+        width={Math.min(1920, source.width || 1280)}
+        height={Math.min(1080, source.height || 720)}
         onClick={handleTogglePlay}
         className="w-full h-full object-contain cursor-pointer"
       />
@@ -438,7 +449,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         {isCrossfading && (
           <div className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-amber-500/20 backdrop-blur-md border border-amber-500/50 shadow-lg text-[11px] font-mono text-amber-300 animate-pulse">
             <Sparkles className="w-3 h-3 text-amber-300" />
-            <span>DISSOLVING {Math.round(blendProgress * 100)}%</span>
+            <span ref={dissolveTextRef}>DISSOLVING</span>
           </div>
         )}
       </div>

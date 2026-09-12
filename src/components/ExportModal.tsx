@@ -2,7 +2,20 @@ import React, { useState, useRef } from 'react';
 import { ExportSettings, LoopSettings, ExportFps, ExportResolution, ExportBitrate } from '../types';
 import { exportLoopedVideo, calculateExportDimensions, calculateExportBitrate } from '../utils/videoExporter';
 import { useAuth } from '../context/AuthContext';
-import { X, Download, Film, CheckCircle2, AlertCircle, Sparkles, ShieldCheck, Gauge, Sliders, Layers } from 'lucide-react';
+import {
+  X,
+  Download,
+  Film,
+  CheckCircle2,
+  AlertCircle,
+  Sparkles,
+  ShieldCheck,
+  Gauge,
+  Sliders,
+  Layers,
+  Share2,
+  ExternalLink,
+} from 'lucide-react';
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -35,11 +48,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   const [isExporting, setIsExporting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState('');
+  const [renderFrame, setRenderFrame] = useState<{ current: number; total: number }>({ current: 0, total: 0 });
   const [exportedUrl, setExportedUrl] = useState<string | null>(null);
   const [exportedBlob, setExportedBlob] = useState<Blob | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const liveRenderCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   if (!isOpen || !currentUser) return null;
 
@@ -61,6 +76,16 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
   const totalFrames = Math.max(1, Math.round(estimatedExportDur * (exportSettings.fps || 30)));
 
+  const cleanName = sourceName.replace(/\.[^/.]+$/, '').replace(/[^a-z0-9_-]/gi, '_') || 'seamless_loop';
+  const isMp4 = exportedBlob?.type.includes('mp4') || exportSettings.format === 'mp4';
+  const ext = isMp4 ? 'mp4' : 'webm';
+  const downloadFilename = `${cleanName}_seamless_loop_${exportSettings.fps}fps.${ext}`;
+
+  const canShare =
+    typeof navigator !== 'undefined' &&
+    typeof (navigator as any).canShare === 'function' &&
+    typeof (navigator as any).share === 'function';
+
   const handleStartExport = async () => {
     // Check and deduct credit
     const allowed = deductCredit();
@@ -72,6 +97,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setIsExporting(true);
     setProgress(0);
     setStatusText('Preparing hardware video encoder...');
+    setRenderFrame({ current: 0, total: totalFrames });
     setErrorMessage(null);
     setExportedUrl(null);
     setExportedBlob(null);
@@ -84,11 +110,15 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         videoSourceUrl,
         settings,
         exportSettings,
-        (p, status) => {
+        (p, status, currFrame, totFrames) => {
           setProgress(p);
           setStatusText(status);
+          if (currFrame) {
+            setRenderFrame({ current: currFrame, total: totFrames || totalFrames });
+          }
         },
-        abortController.signal
+        abortController.signal,
+        liveRenderCanvasRef.current
       );
 
       const url = URL.createObjectURL(blob);
@@ -110,17 +140,47 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setIsExporting(false);
   };
 
-  const handleDownload = () => {
+  const handleShareMobile = async () => {
+    if (!exportedBlob) return;
+    try {
+      const file = new File([exportedBlob], downloadFilename, {
+        type: exportedBlob.type || (isMp4 ? 'video/mp4' : 'video/webm'),
+      });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({
+          files: [file],
+          title: 'Seamless Looped Video',
+          text: `Seamless video loop (${exportSettings.fps} FPS)`,
+        });
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        console.warn('Share error:', err);
+      }
+    }
+  };
+
+  const handleDownloadSafe = (e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+    }
     if (!exportedUrl || !exportedBlob) return;
-    const a = document.createElement('a');
-    a.href = exportedUrl;
-    const cleanName = sourceName.replace(/\.[^/.]+$/, '').replace(/[^a-z0-9_-]/gi, '_');
-    const isMp4 = exportedBlob.type.includes('mp4') || exportSettings.format === 'mp4';
-    const ext = isMp4 ? 'mp4' : 'webm';
-    a.download = `${cleanName}_seamless_loop_${exportSettings.fps}fps.${ext}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    try {
+      const a = document.createElement('a');
+      a.href = exportedUrl;
+      a.download = downloadFilename;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        try {
+          if (a.parentNode) document.body.removeChild(a);
+        } catch {}
+      }, 1000);
+    } catch (err) {
+      console.error('Download error:', err);
+    }
   };
 
   return (
@@ -434,18 +494,33 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
             )}
 
-            {/* Progress indicator during rendering */}
+            {/* Progress indicator during rendering with Live Monitor */}
             {isExporting && (
-              <div className="space-y-2 pt-1">
-                <div className="flex justify-between text-xs text-stone-300 font-mono">
-                  <span className="truncate max-w-[80%]">{statusText}</span>
-                  <span className="text-amber-400 font-semibold">{progress}%</span>
-                </div>
-                <div className="w-full bg-stone-950 h-2 rounded-full overflow-hidden border border-stone-800">
-                  <div
-                    className="h-full bg-gradient-to-r from-amber-500 to-amber-300 transition-all duration-200"
-                    style={{ width: `${progress}%` }}
+              <div className="space-y-3 pt-1">
+                <div className="relative aspect-video max-h-44 w-full bg-black rounded-xl overflow-hidden border border-stone-800 flex items-center justify-center shadow-inner">
+                  <canvas
+                    ref={liveRenderCanvasRef}
+                    className="w-full h-full object-contain"
                   />
+                  <div className="absolute top-2 left-2 bg-stone-900/85 backdrop-blur-sm border border-stone-700/80 rounded px-2 py-0.5 text-[10px] font-mono text-amber-300 flex items-center gap-1.5 shadow-sm">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                    <span>
+                      LIVE RENDER: Frame {renderFrame.current} / {renderFrame.total || totalFrames}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs text-stone-300 font-mono">
+                    <span className="truncate max-w-[80%]">{statusText}</span>
+                    <span className="text-amber-400 font-semibold">{progress}%</span>
+                  </div>
+                  <div className="w-full bg-stone-950 h-2 rounded-full overflow-hidden border border-stone-800">
+                    <div
+                      className="h-full bg-gradient-to-r from-amber-500 to-amber-300 transition-all duration-150"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
                 </div>
               </div>
             )}
@@ -492,7 +567,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             <div>
               <h3 className="text-base font-semibold text-stone-100 mb-1">Seamless Loop Ready</h3>
               <p className="text-xs text-stone-400 font-mono">
-                Format: <span className="text-amber-400 font-semibold">{exportedBlob?.type.includes('mp4') ? 'MP4 (H.264 Universal)' : 'WebM (VP9)'}</span> • Duration: {estimatedExportDur.toFixed(1)}s • FPS: {exportSettings.fps} • Size: {exportedBlob ? (exportedBlob.size / 1024 / 1024).toFixed(2) : 0} MB
+                Format: <span className="text-amber-400 font-semibold">{exportedBlob?.type.includes('mp4') ? 'MP4 (Universal)' : 'WebM (VP9)'}</span> • Duration: {estimatedExportDur.toFixed(1)}s • FPS: {exportSettings.fps} • Size: {exportedBlob ? (exportedBlob.size / 1024 / 1024).toFixed(2) : 0} MB
               </p>
             </div>
 
@@ -509,23 +584,52 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               />
             </div>
 
-            <div className="flex items-center justify-center gap-3 pt-2">
+            {/* Download and Share Actions */}
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5 pt-2">
               <button
                 type="button"
                 onClick={() => setExportedUrl(null)}
-                className="px-4 py-2 text-xs font-medium text-stone-400 hover:text-stone-200 transition-colors"
+                className="w-full sm:w-auto px-4 py-2.5 text-xs font-medium text-stone-400 hover:text-stone-200 transition-colors"
               >
                 Back to Settings
               </button>
-              <button
-                type="button"
+
+              {canShare && (
+                <button
+                  type="button"
+                  id="share-exported-video-btn"
+                  onClick={handleShareMobile}
+                  className="w-full sm:w-auto flex items-center justify-center gap-2 px-4 py-2.5 bg-stone-800 hover:bg-stone-700 text-stone-200 text-xs font-semibold rounded-xl border border-stone-700 transition-colors cursor-pointer"
+                >
+                  <Share2 className="w-4 h-4 text-amber-400" />
+                  <span>Save to Photos / Share</span>
+                </button>
+              )}
+
+              <a
                 id="download-exported-video-btn"
-                onClick={handleDownload}
-                className="flex items-center gap-2 px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-stone-950 text-xs font-semibold rounded-xl shadow-[0_0_20px_rgba(245,158,11,0.3)] transition-all cursor-pointer"
+                href={exportedUrl}
+                download={downloadFilename}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={handleDownloadSafe}
+                className="w-full sm:w-auto flex items-center justify-center gap-2 px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-stone-950 text-xs font-semibold rounded-xl shadow-[0_0_20px_rgba(245,158,11,0.3)] transition-all cursor-pointer"
               >
                 <Download className="w-4 h-4" />
                 <span>Download Looped Video</span>
-              </button>
+              </a>
+            </div>
+
+            <div className="pt-1">
+              <a
+                href={exportedUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-[11px] text-stone-400 hover:text-stone-200 underline underline-offset-4 transition-colors"
+              >
+                <ExternalLink className="w-3 h-3" />
+                <span>Having trouble? Open video file in a new tab</span>
+              </a>
             </div>
           </div>
         )}
