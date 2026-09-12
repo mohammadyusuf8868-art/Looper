@@ -1,0 +1,6 @@
+{
+  "name": "Video Looper",
+  "description": "Create seamless, gapless looping videos with crossfade dissolve, ping-pong reverse, and seam alignment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
